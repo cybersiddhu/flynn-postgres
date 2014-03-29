@@ -386,15 +386,20 @@ func (f *follower) Stop() error {
 }
 
 func writeConfig(dataDir string) {
-    err := copyFile("/etc/postgresql/9.3/main/postgresql.conf", filepath.Join(dataDir, "postgresql.conf"))
-    if err != nil {
-        log.Fatalln("Error creating postgresql.conf", err)
-    }
+	err := copyFile("/etc/postgresql/9.3/main/postgresql.conf", filepath.Join(dataDir, "postgresql.conf"))
+	if err != nil {
+		log.Fatalln("Error creating postgresql.conf", err)
+	}
 
-    err = copyFile("/etc/postgresql/9.3/main/pg_hba.conf", filepath.Join(dataDir, "pg_hba.conf"))
-    if err != nil {
-        log.Fatalln("Error creating pg_hba.conf", err)
-    }
+	err = copyFile("/etc/postgresql/9.3/main/pg_hba.conf", filepath.Join(dataDir, "pg_hba.conf"))
+	if err != nil {
+		log.Fatalln("Error creating pg_hba.conf", err)
+	}
+
+	err = writeCert(os.Getenv("EXTERNAL_IP"), dataDir)
+	if err != nil {
+		log.Fatalln("Error writing ssl info", err)
+	}
 }
 
 func copyFile(src, dest string) error {
@@ -414,23 +419,25 @@ func copyFile(src, dest string) error {
 }
 
 func startPostgres(dataDir string) (*exec.Cmd, error) {
+<<<<<<< HEAD
     writeConfig(dataDir)
 
-    log.Println("Starting postgres...")
-    cmd := exec.Command(
-        filepath.Join(*pgbin, "postgres"),
-        "-D", dataDir,
-        "-p", os.Getenv("PORT"),
-        "-h", "*",
-    )
-    log.Println("exec", strings.Join(cmd.Args, " "))
-    cmd.Stdout = os.Stdout
-    cmd.Stderr = os.Stderr
-    if err := cmd.Start(); err != nil {
-        return nil, err
-    }
-    go handleSignals(cmd)
-    return cmd, nil
+	log.Println("Starting postgres...")
+	cmd := exec.Command(
+		filepath.Join(*pgbin, "postgres"),
+		"-D", dataDir, // Set datadir
+		"-p", os.Getenv("PORT"), // Set port to $PORT
+		"-h", "*", // Listen on all interfaces
+		"-l", // Enable SSL
+	)
+	log.Println("exec", strings.Join(cmd.Args, " "))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	go handleSignals(cmd)
+	return cmd, nil
 }
 
 func handleSignals(cmd *exec.Cmd) {
