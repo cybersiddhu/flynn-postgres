@@ -1,4 +1,4 @@
-package main
+package centos
 
 import (
     "bytes"
@@ -19,22 +19,23 @@ import (
     "text/template"
     "time"
 
+    "github.com/codegangsta/cli"
     da "github.com/flynn/discoverd/agent"
     "github.com/flynn/go-discoverd"
     _ "github.com/lib/pq"
 )
 
-var dataDir = flag.String("data", "/data", "postgresql data directory")
-var serviceName = flag.String("service", "pg", "discoverd service name")
-var pgbin = flag.String("pgbin", "/usr/lib/postgresql/9.3/bin/", "postgres binary directory")
+func RunPg(c *cli.Context) {
+    var addr string
+    if len(c.String("discoverd")) > 0 {
+        addr = c.String("discoverd")
+    } else if len(os.Getenv("DISCOVERD")) > 0 {
+        addr = os.Getenv("DISCOVERD")
+    } else {
+        log.Fatal("discoverd service ip is not defined")
+    }
 
-//var addr = ":" + os.Getenv("PORT")
-var addr = os.Getenv("DISCOVERD")
-
-func main() {
-    flag.Parse()
-
-    set, err := discoverd.RegisterWithSet(*serviceName, addr, nil)
+    set, err := discoverd.RegisterWithSet(c.String("service"), addr, nil)
     if err != nil {
         log.Fatal(err)
     }
@@ -49,16 +50,16 @@ func main() {
         }
         if l.Addr == set.SelfAddr() {
             if follower == nil {
-                leader, done = startLeader()
+                leader, done = startLeader(c)
             } else {
-                leader, done = promoteToLeader(follower, username, password)
+                leader, done = promoteToLeader(follower, username, password, c)
             }
             goto wait
         } else {
             if follower == nil {
-                follower = startFollower(l, set)
+                follower = startFollower(l, set, c)
             } else {
-                follower = switchLeader(l, set, follower)
+                follower = switchLeader(l, set, follower, c)
             }
         }
     }
@@ -70,13 +71,13 @@ wait:
     procExit(leader)
 }
 
-func startLeader() (*exec.Cmd, <-chan struct{}) {
+func startLeader(c *cli.Context) (*exec.Cmd, <-chan struct{}) {
     log.Println("Starting as leader...")
-    if err := dirIsEmpty(*dataDir); err == nil {
+    if err := dirIsEmpty(c.String("data")); err == nil {
         log.Println("Running initdb...")
         runCmd(exec.Command(
-            filepath.Join(*pgbin, "initdb"),
-            "-D", *dataDir,
+            filepath.Join(c.String("pgbin"), "initdb"),
+            "-D", c.String("data"),
             "--encoding=UTF-8",
             "--locale=en_US.UTF-8", // TODO: make this configurable?
         ))
@@ -84,15 +85,15 @@ func startLeader() (*exec.Cmd, <-chan struct{}) {
         log.Fatal(err)
     }
 
-    cmd, err := startPostgres(*dataDir)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
 
-    db := waitForPostgres(time.Minute)
+    db := waitForPostgres(time.Minute, c)
     password := createSuperuser(db)
     db.Close()
-    register(map[string]string{"username": "flynn", "password": password, "up": "true"})
+    register(map[string]string{"username": "flynn", "password": password, "up": "true"}, c)
 
     done := make(chan struct{})
     go func() {
@@ -103,8 +104,8 @@ func startLeader() (*exec.Cmd, <-chan struct{}) {
     return cmd, done
 }
 
-func register(attrs map[string]string) {
-    err := discoverd.RegisterWithAttributes(*serviceName, addr, attrs)
+func register(attrs map[string]string, c *cli.Context) {
+    err := discoverd.RegisterWithAttributes(c.String("service"), c.String("discoverd"), attrs)
     if err != nil {
         log.Fatalln("discoverd registration error:", err)
     }
@@ -147,14 +148,16 @@ func generatePassword() string {
     return string(bytes.TrimRight(enc, "="))
 }
 
-var pgstr = "user=postgres host=/var/run/postgresql sslmode=disable port=" + os.Getenv("PORT")
+func GeneratePgDataSource(c *cli.Context) string {
+    return "user=postgres host=/var/run/postgresql sslmode=disable port=" + c.String("port")
+}
 
-func waitForPostgres(maxWait time.Duration) *sql.DB {
+func waitForPostgres(maxWait time.Duration, c *cli.Context) *sql.DB {
     log.Println("Waiting for postgres to boot...")
     start := time.Now()
     for {
         var ping string
-        db, err := sql.Open("postgres", pgstr)
+        db, err := sql.Open("postgres", GeneratePgDataSource(c))
         if err != nil {
             goto fail
         }
@@ -173,9 +176,9 @@ func waitForPostgres(maxWait time.Duration) *sql.DB {
     }
 }
 
-func waitForPromotion() {
+func waitForPromotion(c *cli.Context) {
     log.Println("Waiting for promotion...")
-    db, err := sql.Open("postgres", pgstr)
+    db, err := sql.Open("postgres", GeneratePgDataSource(c))
     if err != nil {
         log.Fatalln("Error connecting to postgres:", err)
     }
@@ -193,22 +196,22 @@ func waitForPromotion() {
     }
 }
 
-func promoteToLeader(follower *follower, username, password string) (*exec.Cmd, <-chan struct{}) {
+func promoteToLeader(follower *follower, username, password string, c *cli.Context) (*exec.Cmd, <-chan struct{}) {
     log.Println("Promoting follower to leader...")
-    register(map[string]string{"up": "false"})
-    f, err := os.Create(filepath.Join(*dataDir, "promote.trigger"))
+    register(map[string]string{"up": "false"}, c)
+    f, err := os.Create(filepath.Join(c.String("data"), "promote.trigger"))
     if err != nil {
         panic(err)
     }
     f.Close()
 
-    waitForPromotion()
+    waitForPromotion(c)
 
     if username == "" || password == "" {
         // TODO: create superuser
     }
 
-    register(map[string]string{"up": "true", "username": username, "password": password})
+    register(map[string]string{"up": "true", "username": username, "password": password}, c)
     log.Println("Follower promoted to leader.")
     return follower.Cancel()
 }
@@ -226,11 +229,11 @@ func runCmd(cmd *exec.Cmd) {
     }
 }
 
-func pullBaseBackup(s *discoverd.Service) {
+func pullBaseBackup(s *discoverd.Service, c *cli.Context) {
     log.Println("Running pg_basebackup...")
-    runCmd(exec.Command(
-        "pg_basebackup",
-        "-D", *dataDir,
+    runCmd(exec.Command(filepath.Join(c.String("pgbin"),
+        "pg_basebackup"),
+        "-D", c.String("data"),
         "-d", fmt.Sprintf("host=%s port=%s user=%s password=%s", s.Host, s.Port, s.Attrs["username"], s.Attrs["password"]),
         "--xlog-method=stream",
         "--progress",
@@ -253,8 +256,8 @@ type recoveryConfig struct {
     Trigger  string
 }
 
-func writeRecoveryConf(dir string, leader *discoverd.Service) {
-    f, err := os.Create(filepath.Join(dir, "recovery.conf"))
+func writeRecoveryConf(leader *discoverd.Service, c *cli.Context) {
+    f, err := os.Create(filepath.Join(c.String("data"), "recovery.conf"))
     if err != nil {
         log.Fatalln("Error creating recovery.conf:", err)
     }
@@ -265,7 +268,7 @@ func writeRecoveryConf(dir string, leader *discoverd.Service) {
         Port:     leader.Port,
         Username: leader.Attrs["username"],
         Password: leader.Attrs["password"],
-        Trigger:  filepath.Join(dir, "promote.trigger"),
+        Trigger:  filepath.Join(c.String("data"), "promote.trigger"),
     })
     if err != nil {
         log.Fatalln("Error writing recovery.conf:", err)
@@ -299,43 +302,43 @@ func waitForLeaderUp(leader *discoverd.Service, set discoverd.ServiceSet) *disco
     return nil
 }
 
-func startFollower(leader *discoverd.Service, set discoverd.ServiceSet) *follower {
+func startFollower(leader *discoverd.Service, set discoverd.ServiceSet, c *cli.Context) *follower {
     log.Println("Starting as follower...")
     leader = waitForLeaderUp(leader, set)
-    if err := dirIsEmpty(*dataDir); err == nil {
-        pullBaseBackup(leader)
+    if err := dirIsEmpty(c.String("data")); err == nil {
+        pullBaseBackup(leader, c)
     } else if err != ErrNotEmpty {
         log.Fatal(err)
     }
 
-    writeRecoveryConf(*dataDir, leader)
-    cmd, err := startPostgres(*dataDir)
+    writeRecoveryConf(leader, c)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
 
-    waitForPostgres(time.Minute).Close()
-    register(map[string]string{"up": "true"})
+    waitForPostgres(time.Minute, c).Close()
+    register(map[string]string{"up": "true"}, c)
     log.Println("Follower started.")
 
     // TODO: if data and insufficient WAL, pg_basebackup
     return newFollower(cmd)
 }
 
-func switchLeader(leader *discoverd.Service, set discoverd.ServiceSet, follower *follower) *follower {
+func switchLeader(leader *discoverd.Service, set discoverd.ServiceSet, follower *follower, c *cli.Context) *follower {
     log.Println("Switching leaders...")
     leader = waitForLeaderUp(leader, set)
-    register(map[string]string{"up": "false"})
-    writeRecoveryConf(*dataDir, leader)
+    register(map[string]string{"up": "false"}, c)
+    writeRecoveryConf(leader, c)
     follower.Stop()
 
-    cmd, err := startPostgres(*dataDir)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
-    waitForPostgres(time.Minute).Close()
+    waitForPostgres(time.Minute, c).Close()
     // TODO: check for insufficient WAL, then pg_basebackup
-    register(map[string]string{"up": "true"})
+    register(map[string]string{"up": "true"}, c)
     log.Println("Leader switch complete.")
     return newFollower(cmd)
 }
@@ -384,21 +387,21 @@ func (f *follower) Stop() error {
     return nil
 }
 
-func writeConfig(dataDir string) {
-    err := copyFile("/etc/postgresql/9.3/main/postgresql.conf", filepath.Join(dataDir, "postgresql.conf"))
+func writeConfig(c *cli.Context) {
+    err := copyFile("/etc/postgresql/9.3/main/postgresql.conf", filepath.Join(c.String("data"), "postgresql.conf"))
     if err != nil {
         log.Fatalln("Error creating postgresql.conf", err)
     }
 
-    err = copyFile("/etc/postgresql/9.3/main/pg_hba.conf", filepath.Join(dataDir, "pg_hba.conf"))
+    err = copyFile("/etc/postgresql/9.3/main/pg_hba.conf", filepath.Join(c.String("data"), "pg_hba.conf"))
     if err != nil {
         log.Fatalln("Error creating pg_hba.conf", err)
     }
 
-    err = writeCert(os.Getenv("EXTERNAL_IP"), dataDir)
-    if err != nil {
-        log.Fatalln("Error writing ssl info", err)
-    }
+    //err = writeCert(os.Getenv("EXTERNAL_IP"), dataDir))
+    //if err != nil {
+    //log.Fatalln("Error writing ssl info", err)
+    //}
 }
 
 func copyFile(src, dest string) error {
@@ -417,14 +420,14 @@ func copyFile(src, dest string) error {
     return err
 }
 
-func startPostgres(dataDir string) (*exec.Cmd, error) {
-    writeConfig(dataDir)
+func startPostgres(c *cli.Context) (*exec.Cmd, error) {
+    writeConfig(c)
 
     log.Println("Starting postgres...")
     cmd := exec.Command(
-        filepath.Join(*pgbin, "postgres"),
-        "-D", dataDir, // Set datadir
-        "-p", os.Getenv("PORT"), // Set port to $PORT
+        filepath.Join(c.String("pgbin"), "postgres"),
+        "-D", c.String("data"), // Set datadir
+        "-p", c.String("port"), // Set port to $PORT
         "-h", "*", // Listen on all interfaces
         "-l", // Enable SSL
     )
