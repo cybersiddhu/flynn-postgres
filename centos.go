@@ -6,7 +6,6 @@ import (
     "database/sql"
     "encoding/base64"
     "errors"
-    "flag"
     "fmt"
     "io"
     "log"
@@ -20,22 +19,23 @@ import (
     "text/template"
     "time"
 
+    "github.com/codegangsta/cli"
     da "github.com/flynn/discoverd/agent"
     "github.com/flynn/go-discoverd"
     _ "github.com/lib/pq"
 )
 
-var dataDir = flag.String("data", "/data", "postgresql data directory")
-var serviceName = flag.String("service", "pg", "discoverd service name")
-var pgbin = flag.String("pgbin", "/usr/lib/postgresql/9.3/bin/", "postgres binary directory")
+func RunCentosPg(c *cli.Context) {
+    var addr string
+    if len(c.String("discoverd")) > 0 {
+        addr = c.String("discoverd")
+    } else if len(os.Getenv("DISCOVERD")) > 0 {
+        addr = os.Getenv("DISCOVERD")
+    } else {
+        log.Fatal("discoverd service ip is not defined")
+    }
 
-//var addr = ":" + os.Getenv("PORT")
-var addr = os.Getenv("DISCOVERD")
-
-func main() {
-    flag.Parse()
-
-    set, err := discoverd.RegisterWithSet(*serviceName, addr, nil)
+    set, err := discoverd.RegisterWithSet(c.String("service"), addr, nil)
     if err != nil {
         log.Fatal(err)
     }
@@ -50,16 +50,16 @@ func main() {
         }
         if l.Addr == set.SelfAddr() {
             if follower == nil {
-                leader, done = startLeader()
+                leader, done = startLeader(c)
             } else {
                 leader, done = promoteToLeader(follower, username, password)
             }
             goto wait
         } else {
             if follower == nil {
-                follower = startFollower(l, set)
+                follower = startFollower(l, set, c)
             } else {
-                follower = switchLeader(l, set, follower)
+                follower = switchLeader(l, set, follower, c)
             }
         }
     }
@@ -71,13 +71,13 @@ wait:
     procExit(leader)
 }
 
-func startLeader() (*exec.Cmd, <-chan struct{}) {
+func startLeader(c *cli.Context) (*exec.Cmd, <-chan struct{}) {
     log.Println("Starting as leader...")
-    if err := dirIsEmpty(*dataDir); err == nil {
+    if err := dirIsEmpty(c.String("data")); err == nil {
         log.Println("Running initdb...")
         runCmd(exec.Command(
-            filepath.Join(*pgbin, "initdb"),
-            "-D", *dataDir,
+            filepath.Join(c.String("pgbin"), "initdb"),
+            "-D", c.String("data"),
             "--encoding=UTF-8",
             "--locale=en_US.UTF-8", // TODO: make this configurable?
         ))
@@ -85,7 +85,7 @@ func startLeader() (*exec.Cmd, <-chan struct{}) {
         log.Fatal(err)
     }
 
-    cmd, err := startPostgres(*dataDir)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
@@ -227,11 +227,11 @@ func runCmd(cmd *exec.Cmd) {
     }
 }
 
-func pullBaseBackup(s *discoverd.Service) {
+func pullBaseBackup(s *discoverd.Service, c cli.Context) {
     log.Println("Running pg_basebackup...")
-    runCmd(exec.Command(
-        "pg_basebackup",
-        "-D", *dataDir,
+    runCmd(exec.Command(filepath.Join(c.String("pgbin"),
+        "pg_basebackup"),
+        "-D", c.String("data"),
         "-d", fmt.Sprintf("host=%s port=%s user=%s password=%s", s.Host, s.Port, s.Attrs["username"], s.Attrs["password"]),
         "--xlog-method=stream",
         "--progress",
@@ -254,8 +254,8 @@ type recoveryConfig struct {
     Trigger  string
 }
 
-func writeRecoveryConf(dir string, leader *discoverd.Service) {
-    f, err := os.Create(filepath.Join(dir, "recovery.conf"))
+func writeRecoveryConf(leader *discoverd.Service, c *cli.Context) {
+    f, err := os.Create(filepath.Join(c.String("data"), "recovery.conf"))
     if err != nil {
         log.Fatalln("Error creating recovery.conf:", err)
     }
@@ -266,7 +266,7 @@ func writeRecoveryConf(dir string, leader *discoverd.Service) {
         Port:     leader.Port,
         Username: leader.Attrs["username"],
         Password: leader.Attrs["password"],
-        Trigger:  filepath.Join(dir, "promote.trigger"),
+        Trigger:  filepath.Join(c.String("data"), "promote.trigger"),
     })
     if err != nil {
         log.Fatalln("Error writing recovery.conf:", err)
@@ -300,17 +300,17 @@ func waitForLeaderUp(leader *discoverd.Service, set discoverd.ServiceSet) *disco
     return nil
 }
 
-func startFollower(leader *discoverd.Service, set discoverd.ServiceSet) *follower {
+func startFollower(leader *discoverd.Service, set discoverd.ServiceSet, c *cli.Context) *follower {
     log.Println("Starting as follower...")
     leader = waitForLeaderUp(leader, set)
-    if err := dirIsEmpty(*dataDir); err == nil {
-        pullBaseBackup(leader)
+    if err := dirIsEmpty(c.String("data")); err == nil {
+        pullBaseBackup(leader, c)
     } else if err != ErrNotEmpty {
         log.Fatal(err)
     }
 
-    writeRecoveryConf(*dataDir, leader)
-    cmd, err := startPostgres(*dataDir)
+    writeRecoveryConf(leader, c)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
@@ -323,14 +323,14 @@ func startFollower(leader *discoverd.Service, set discoverd.ServiceSet) *followe
     return newFollower(cmd)
 }
 
-func switchLeader(leader *discoverd.Service, set discoverd.ServiceSet, follower *follower) *follower {
+func switchLeader(leader *discoverd.Service, set discoverd.ServiceSet, follower *follower, c *cli.Context) *follower {
     log.Println("Switching leaders...")
     leader = waitForLeaderUp(leader, set)
     register(map[string]string{"up": "false"})
-    writeRecoveryConf(*dataDir, leader)
+    writeRecoveryConf(leader, c)
     follower.Stop()
 
-    cmd, err := startPostgres(*dataDir)
+    cmd, err := startPostgres(c)
     if err != nil {
         log.Fatal(err)
     }
@@ -418,14 +418,14 @@ func copyFile(src, dest string) error {
     return err
 }
 
-func startPostgres(dataDir string) (*exec.Cmd, error) {
+func startPostgres(c *cli.Context) (*exec.Cmd, error) {
     writeConfig(dataDir)
 
     log.Println("Starting postgres...")
     cmd := exec.Command(
-        filepath.Join(*pgbin, "postgres"),
-        "-D", dataDir, // Set datadir
-        "-p", os.Getenv("PORT"), // Set port to $PORT
+        filepath.Join(c.String("pgbin"), "postgres"),
+        "-D", c.String("data"), // Set datadir
+        "-p", c.String("port"), // Set port to $PORT
         "-h", "*", // Listen on all interfaces
         "-l", // Enable SSL
     )
