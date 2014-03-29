@@ -1,10 +1,9 @@
-package main
+package centos
 
 import (
     "os"
 
     "github.com/codegangsta/cli"
-    "github.com/cybersiddhu/flynn-postgres/centos"
 )
 
 func main() {
@@ -23,7 +22,7 @@ func main() {
         cli.StringFlag{"port", "5432", "postgresql port, default is 5432"},
     }
     app.Action = func(c *cli.Context) {
-        centos.RunPg(c)
+        RunPg(c)
     }
     app.Run(os.Args)
 }
