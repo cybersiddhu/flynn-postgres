@@ -6,6 +6,7 @@ import (
     "database/sql"
     "encoding/base64"
     "errors"
+    "flag"
     "fmt"
     "io"
     "log"
@@ -289,7 +290,7 @@ func waitForLeaderUp(leader *discoverd.Service, set discoverd.ServiceSet) *disco
         return leader
     }
     log.Println("Waiting for leader to come up...")
-    watch := set.Watch(true, false)
+    watch := set.Watch(true)
     defer set.Unwatch(watch)
     for update := range watch {
         if update.Addr == set.Leader().Addr && update.Attrs["up"] == "true" {
